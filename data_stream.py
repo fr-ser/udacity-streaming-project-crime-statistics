@@ -1,75 +1,133 @@
-import logging
 import json
+import os
+import time
+
 from pyspark.sql import SparkSession
-from pyspark.sql.types import *
+import pyspark.sql.types as pst
 import pyspark.sql.functions as psf
 
 
-# TODO Create a schema for incoming resources
-schema = StructType([
+RADIO_CODE_JSON_FILEPATH = os.environ.get("RADIO_CODE_JSON_FILEPATH", "./radio_code.json")
+KAFKA_BROKER_URL = os.environ.get("KAFKA_BROKER_URL", "localhost:9092")
+KAFKA_TOPIC = "udacity.project.spark-streaming.police"
+
+
+schema = pst.StructType([
+    pst.StructField("crime_id", pst.StringType()),  # : "183653763",
+    pst.StructField("original_crime_type_name", pst.StringType()),  # : "Traffic Stop",
+    pst.StructField("report_date", pst.DateType()),  # : "2018-12-31T00:00:00.000",
+    pst.StructField("call_date", pst.DateType()),  # : "2018-12-31T00:00:00.000",
+    pst.StructField("offense_date", pst.DateType()),  # : "2018-12-31T00:00:00.000",
+    pst.StructField("call_time", pst.StringType()),  # : "23:57",
+    pst.StructField("call_date_time", pst.TimestampType()),  # : "2018-12-31T23:57:00.000",
+    pst.StructField("disposition", pst.StringType()),  # : "ADM",
+    pst.StructField("address", pst.StringType()),  # : "Geary Bl/divisadero St",
+    pst.StructField("city", pst.StringType()),  # : "San Francisco",
+    pst.StructField("state", pst.StringType()),  # : "CA",
+    pst.StructField("agency_id", pst.StringType()),  # : "1",
+    pst.StructField("address_type", pst.StringType()),  # : "Intersection",
+    pst.StructField("common_location", pst.StringType()),  # : ""
 ])
+
 
 def run_spark_job(spark):
 
-    # TODO Create Spark Configuration
-    # Create Spark configurations with max offset of 200 per trigger
-    # set up correct bootstrap server and port
-    df = spark \
-        .readStream \
+    df = (
+        spark
+        .readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", "kafka:29092")
+        .option("subscribe", "udacity.project.spark-streaming.police")
+        .option("startingOffsets", "earliest")
+        # .option("kafkaConsumer.pollTimeoutMs", 3_000)
+        .option("maxOffsetsPerTrigger", 6_000)
+        .option("stopGracefullyOnShutdown", "true")
+        .load()
+    )
 
-    # Show schema for the incoming resources for checks
-    df.printSchema()
+    kafka_df = df.selectExpr("CAST(value AS STRING)")
 
-    # TODO extract the correct column from the kafka input resources
-    # Take only value and convert it to String
-    kafka_df = df.selectExpr("")
+    service_table = kafka_df.select(
+        psf.from_json(psf.col("value"), schema).alias("parsed")
+    ).select("parsed.*")
+    service_table.createOrReplaceTempView("service")
 
-    service_table = kafka_df\
-        .select(psf.from_json(psf.col('value'), schema).alias("DF"))\
-        .select("DF.*")
+    window_agg_df = (
+        service_table
+        .withWatermark("call_date_time", "1 hour")
+        .groupBy(
+            psf.window(service_table.call_date_time, "30 minutes"),
+            service_table.original_crime_type_name,
+            service_table.disposition,
+        ).count()
+    )
+    window_agg_df.createOrReplaceTempView("windowed_crime_types")
 
-    # TODO select original_crime_type_name and disposition
-    distinct_table = 
+    query_q1 = (
+        window_agg_df
+        .writeStream
+        .outputMode("update")
+        .format("console")
+        .start()
+    )
 
-    # count the number of original crime type
-    agg_df = 
+    radio_code_df = spark.read.option("multiLine", True).json(RADIO_CODE_JSON_FILEPATH)
+    radio_code_df.createOrReplaceTempView("radio_code")
 
-    # TODO Q1. Submit a screen shot of a batch ingestion of the aggregation
-    # TODO write output stream
-    query = agg_df \
+    join_query = spark.sql("""
+        SELECT ct.*, r.description
+        FROM windowed_crime_types as ct
+        LEFT JOIN radio_code as r on r.disposition_code = ct.disposition
+    """)
 
+    query_q2 = (
+        join_query
+        .writeStream
+        .outputMode("update")
+        .format("console")
+        .start()
+    )
 
-    # TODO attach a ProgressReporter
-    query.awaitTermination()
+    is_finished = False
+    while not is_finished:
+        time.sleep(10)
+        if not query_q1.lastProgress:
+            continue
 
-    # TODO get the right radio code json path
-    radio_code_json_filepath = ""
-    radio_code_df = spark.read.json(radio_code_json_filepath)
+        # we have 200_000 items in the source
+        partitions = query_q1.lastProgress["sources"][0]["endOffset"][KAFKA_TOPIC]
+        processed_offset = sum(partitions.values())
+        is_finished = processed_offset == 200_000
 
-    # clean up your data so that the column names match on radio_code_df and agg_df
-    # we will want to join on the disposition code
+        print(f"Last progress: {json.dumps(query_q1.lastProgress, indent=2, sort_keys=True)}")
 
-    # TODO rename disposition_code column to disposition
-    radio_code_df = radio_code_df.withColumnRenamed("disposition_code", "disposition")
+    query_q1.stop()
+    print("""
 
-    # TODO join on disposition column
-    join_query = agg_df.
+    #############
+    inital kafka aggregation query reached offset 200_000 and was stopped
+    #############
 
-
-    join_query.awaitTermination()
+    """)
+    query_q1.awaitTermination()
+    query_q2.awaitTermination()
 
 
 if __name__ == "__main__":
-    logger = logging.getLogger(__name__)
-
-    # TODO Create Spark in Standalone mode
     spark = SparkSession \
         .builder \
         .master("local[*]") \
         .appName("KafkaSparkStructuredStreaming") \
         .getOrCreate()
+    spark.sparkContext.setLogLevel('WARN')
 
-    logger.info("Spark started")
+    print("""
+
+    #############
+    spark session started
+    #############
+
+    """)
 
     run_spark_job(spark)
 

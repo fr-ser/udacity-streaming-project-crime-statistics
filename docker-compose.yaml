@@ -48,12 +48,19 @@ services:
     depends_on:
       - kafka-cli
   jupyter:
-    image: jupyter/pyspark-notebook:414b5d749704
+    # this image has Spark 2.4.3 (as required)
+    image: jupyter/pyspark-notebook:822f02b8ce23
     ports:
       - "8888:8888"
       - "4040:4040"
+    environment:
+      RADIO_CODE_JSON_FILEPATH: /opt/spark-data/radio_code.json
+      KAFKA_BROKER_URL: kafka:29092
+      # PYSPARK_SUBMIT_ARGS are used to load the package in the jupyter notebook
+      PYSPARK_SUBMIT_ARGS: "--packages org.apache.spark:spark-sql-kafka-0-10_2.11:2.4.3 pyspark-shell"
     volumes:
       - ./apps:/home/jovyan/work/
-      - ./data:/opt/spark-data
+      - ./data_stream.py:/opt/spark-apps/data_stream.py
+      - ./radio_code.json:/opt/spark-data/radio_code.json
     depends_on:
       - producer
